@@ -13,7 +13,6 @@ import { VoiceOrchestrator } from "@voice-dev-agent/orchestrator";
 import { VoiceController } from "@voice-dev-agent/voice";
 import {
   isDuplicateTranscriptSegment,
-  joinTranscriptSegments,
   sanitizeTranscriptSegment
 } from "./transcript-coalescer.js";
 
@@ -58,6 +57,12 @@ function getNumberEnv(name, fallback) {
 
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function getScribeCommitStrategy() {
+  // The desktop voice loop is continuous. Manual commit keeps the transcript
+  // buffered until stop, which makes the app look unresponsive.
+  return "vad";
 }
 
 function getDefaultOpenClawBinary() {
@@ -113,7 +118,7 @@ function buildConfig() {
           includeLanguageDetection: getBooleanEnv("ELEVENLABS_SCRIBE_INCLUDE_LANGUAGE_DETECTION", true),
           sampleRateHz: 24_000,
           audioFormat: process.env.ELEVENLABS_SCRIBE_AUDIO_FORMAT ?? "pcm_24000",
-          commitStrategy: process.env.ELEVENLABS_SCRIBE_COMMIT_STRATEGY ?? "vad",
+          commitStrategy: getScribeCommitStrategy(),
           vadSilenceThresholdSecs: getNumberEnv("ELEVENLABS_SCRIBE_VAD_SILENCE_THRESHOLD_SECS", 0.45),
           vadThreshold: getNumberEnv("ELEVENLABS_SCRIBE_VAD_THRESHOLD", 0.4),
           minSpeechDurationMs: getNumberEnv("ELEVENLABS_SCRIBE_MIN_SPEECH_DURATION_MS", 80),
@@ -163,9 +168,9 @@ const voiceController = new VoiceController({
 let mainWindow = null;
 let suppressInterruptTranscriptUntil = 0;
 let speechOutputActive = false;
-let pendingTranscriptSegments = [];
-let transcriptFlushTimer = null;
-const TRANSCRIPT_FLUSH_DELAY_MS = getNumberEnv("VOICE_DEV_AGENT_TRANSCRIPT_FLUSH_DELAY_MS", 450);
+let awaitingAgentReply = false;
+let lastSubmittedTranscript = "";
+let lastSubmittedTranscriptAt = 0;
 
 function normalizeSpeechCommand(text) {
   return text
@@ -195,46 +200,74 @@ function appendTranscriptSegment(text) {
     return;
   }
 
-  const lastSegment = pendingTranscriptSegments.at(-1);
-  if (lastSegment && isDuplicateTranscriptSegment(lastSegment, trimmed)) {
+  const duplicate = isDuplicateTranscriptSegment(lastSubmittedTranscript, trimmed);
+  const submittedRecently = duplicate && Date.now() - lastSubmittedTranscriptAt < 12_000;
+  if (submittedRecently) {
     return;
   }
 
-  pendingTranscriptSegments.push(trimmed);
+  lastSubmittedTranscript = trimmed;
+  lastSubmittedTranscriptAt = Date.now();
 }
 
-function clearPendingTranscriptSegments() {
-  pendingTranscriptSegments = [];
-  if (transcriptFlushTimer) {
-    clearTimeout(transcriptFlushTimer);
-    transcriptFlushTimer = null;
-  }
+function clearRecentTranscriptDeduper() {
+  lastSubmittedTranscript = "";
+  lastSubmittedTranscriptAt = 0;
 }
 
-async function flushPendingTranscriptSegments() {
-  if (transcriptFlushTimer) {
-    clearTimeout(transcriptFlushTimer);
-    transcriptFlushTimer = null;
-  }
-
-  const transcript = sanitizeTranscriptSegment(joinTranscriptSegments(pendingTranscriptSegments));
-  pendingTranscriptSegments = [];
-
+function isLikelyNoiseOnlyTranscript(text) {
+  const transcript = sanitizeTranscriptSegment(text);
   if (!transcript) {
+    return true;
+  }
+
+  if (/^[([{<][^)\]}>]{1,80}[)\]}>]$/u.test(transcript)) {
+    return true;
+  }
+
+  const normalized = transcript
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+
+  if (!normalized) {
+    return true;
+  }
+
+  const words = normalized.split(" ").filter(Boolean);
+  if (words.length === 1 && words[0].length === 1) {
+    return true;
+  }
+
+  return false;
+}
+
+function shouldSuppressLiveAudio() {
+  return speechOutputActive || awaitingAgentReply;
+}
+
+async function submitTranscriptToAgent(text) {
+  const transcript = sanitizeTranscriptSegment(text);
+  if (!transcript || isLikelyNoiseOnlyTranscript(transcript)) {
     return;
   }
 
-  await orchestrator.handleTranscript(transcript);
-}
-
-function scheduleTranscriptFlush() {
-  if (transcriptFlushTimer) {
-    clearTimeout(transcriptFlushTimer);
+  const duplicate = isDuplicateTranscriptSegment(lastSubmittedTranscript, transcript);
+  const submittedRecently = duplicate && Date.now() - lastSubmittedTranscriptAt < 12_000;
+  if (submittedRecently || shouldSuppressLiveAudio()) {
+    return;
   }
 
-  transcriptFlushTimer = setTimeout(() => {
-    void flushPendingTranscriptSegments();
-  }, TRANSCRIPT_FLUSH_DELAY_MS);
+  appendTranscriptSegment(transcript);
+  awaitingAgentReply = true;
+
+  try {
+    await orchestrator.handleTranscript(transcript);
+  } catch (error) {
+    awaitingAgentReply = false;
+    throw error;
+  }
 }
 
 function getPayloadText(payload) {
@@ -263,9 +296,14 @@ function emitRendererEvent(type, payload) {
 orchestrator.on("voice:event", async (event) => {
   forwardEvent(event);
 
+  if (event.type === "agent.reply" || event.type === "approval.required" || event.type === "error") {
+    awaitingAgentReply = false;
+  }
+
   if (event.type === "agent.reply") {
     const text = getPayloadText(event.payload);
     if (text) {
+      speechOutputActive = true;
       await voiceController.speak(text);
     }
   }
@@ -275,6 +313,10 @@ voiceController.on("voice:event", async (event) => {
   if (event.type === "transcript.partial") {
     const text = getPayloadText(event.payload);
     if (speechOutputActive && !isSpeechInterruptCommand(text)) {
+      return;
+    }
+
+    if (isLikelyNoiseOnlyTranscript(text)) {
       return;
     }
 
@@ -294,27 +336,27 @@ voiceController.on("voice:event", async (event) => {
       return;
     }
 
-    if (speechOutputActive && !isSpeechInterruptCommand(text)) {
-      clearPendingTranscriptSegments();
+    if (shouldSuppressLiveAudio() && !isSpeechInterruptCommand(text)) {
       return;
     }
 
     if (shouldSuppressInterruptedTranscript(text)) {
       suppressInterruptTranscriptUntil = 0;
-      clearPendingTranscriptSegments();
       return;
     }
 
     if (isSpeechInterruptCommand(text)) {
       suppressInterruptTranscriptUntil = Date.now() + 4_000;
-      clearPendingTranscriptSegments();
       voiceController.interruptSpeech("Interrupted by voice command.");
       emitRendererEvent("tts.interrupted", { reason: "Interrupted by voice command." });
       return;
     }
 
-    appendTranscriptSegment(text);
-    scheduleTranscriptFlush();
+    if (isLikelyNoiseOnlyTranscript(text)) {
+      return;
+    }
+
+    await submitTranscriptToAgent(text);
     return;
   }
 
@@ -329,6 +371,7 @@ voiceController.on("voice:event", async (event) => {
 
   if (event.type === "tts.stopped" || event.type === "tts.interrupted") {
     speechOutputActive = false;
+    awaitingAgentReply = false;
   }
 
   if (event.type === "error") {
@@ -365,15 +408,18 @@ function createWindow() {
 }
 
 ipcMain.handle("voice:start-listening", async () => {
-  clearPendingTranscriptSegments();
+  clearRecentTranscriptDeduper();
+  awaitingAgentReply = false;
+  speechOutputActive = false;
   orchestrator.startListening();
   await voiceController.startListening();
 });
 
 ipcMain.handle("voice:stop-listening", async () => {
-  await flushPendingTranscriptSegments();
   voiceController.stopListening();
   orchestrator.stopListening();
+  awaitingAgentReply = false;
+  speechOutputActive = false;
 });
 
 ipcMain.handle("voice:pause-listening", async () => {
@@ -385,11 +431,14 @@ ipcMain.handle("voice:resume-listening", async () => {
 });
 
 ipcMain.handle("voice:submit-transcript", async (_event, text) => {
-  clearPendingTranscriptSegments();
-  await orchestrator.handleTranscript(text);
+  await submitTranscriptToAgent(text);
 });
 
 ipcMain.handle("voice:audio-chunk", (_event, chunk) => {
+  if (shouldSuppressLiveAudio()) {
+    return;
+  }
+
   voiceController.pushAudioChunk(new Int16Array(chunk));
 });
 
@@ -398,7 +447,6 @@ ipcMain.handle("voice:flush-audio", () => {
 });
 ipcMain.handle("voice:interrupt-speech", () => {
   suppressInterruptTranscriptUntil = Date.now() + 4_000;
-  clearPendingTranscriptSegments();
   const interrupted = voiceController.interruptSpeech("Interrupted by voice command.");
   if (!interrupted) {
     emitRendererEvent("tts.interrupted", { reason: "Interrupted by voice command." });
